@@ -20,13 +20,20 @@
 # WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+#
+# Modifications for changed Google Alerts login procedure
+# 2010-01-11 Martin Bouma, EGOACTIVE
+# www.egoactive.com
+#
 
 from BeautifulSoup import BeautifulSoup
 from getpass import getpass
 from httplib import HTTPConnection, HTTPSConnection
 from operator import itemgetter
 from urllib import urlencode
-
+import urllib2
+import re
 
 # these values must match those used in the Google Alerts web interface:
 
@@ -69,10 +76,9 @@ TYPE_COMPREHENSIVE = 'Comprehensive'
 TYPE_VIDEO = 'Video'
 #: Use this value for :attr:`Alert.type` to indicate groups results
 TYPE_GROUPS = 'Groups'
-
+#: maps available alert types to the values Google uses for them
 TYPE_EVERYTHING = 'Everything'
 
-#: maps available alert types to the values Google uses for them
 ALERT_TYPES = {
     TYPE_NEWS: '1',
     TYPE_BLOGS: '4',
@@ -80,7 +86,7 @@ ALERT_TYPES = {
     TYPE_COMPREHENSIVE: '7',
     TYPE_VIDEO: '9',
     TYPE_GROUPS: '8',
-    TYPE_EVERYTHING: '10', # is this right?
+    TYPE_EVERYTHING: '10',
     }
 
 class SignInError(Exception):
@@ -278,27 +284,51 @@ class GAlertsManager(object):
 
     def _signin(self, password):
         """
-        Obtains a cookie from Google for an authenticated session.
+        Obtains an opener to Google for an authenticated session.
         """
-        params = urlencode({
-            'Email': self.email,
-            'Passwd': password,
-            'service': 'alerts',
-            })
-        headers = {'Content-type': 'application/x-www-form-urlencoded'}
-        conn = HTTPSConnection('www.google.com')
-        conn.request('POST', '/accounts/ClientLogin', params, headers)
-        response = conn.getresponse()
-        body = response.read()
-        try:
-            if response.status == 403:
-                raise SignInError('Got 403 Forbidden; bad email/password combination?')
-            if response.status != 200:
-                raise UnexpectedResponseError(response.status, response.getheaders(), body)
-            self.cookie = '; '.join(body.split('\n'))
-            return (self.cookie is not  None)
-        finally:
-            conn.close()
+        cookieprocessor = urllib2.HTTPCookieProcessor()
+        self.opener = urllib2.build_opener(cookieprocessor)
+        opener = self.opener
+        urllib2.install_opener(opener)
+        
+        # Define URLs
+        login_page_url   = 'https://www.google.com/accounts/ServiceLogin'
+        authenticate_url = 'https://www.google.com/accounts/ServiceLoginAuth'
+
+        # Load sign in page
+        login_page_contents = opener.open(login_page_url).read()
+
+        # Find GALX value
+        galx_match_obj = re.search(r'name="GALX"\s*value="([^"]+)"', login_page_contents, re.IGNORECASE)
+
+        if galx_match_obj.group(1) is not None:
+            galx_value = galx_match_obj.group(1) 
+        else: 
+            galx_value = ''
+
+        # Set up login credentials
+        login_params = urlencode( {
+           'Email' : self.email,
+           'Passwd' : password,
+           'continue' : 'http://www.google.com/alerts/manage',
+           'GALX': galx_value
+        })
+        
+        # Login
+        response = opener.open(authenticate_url, login_params)
+        self.cookie = response.headers['set-cookie']
+        '''
+        print "headers=" + str(response.headers)
+        print "code=" + str(response.code)
+        print "url=" + response.url
+        print "cookie=" + self.cookie
+        #body = response.read()
+        '''
+        if response.code == 403:
+            raise SignInError('Got 403 Forbidden; bad email/password combination?')
+        if response.code != 200:
+            raise UnexpectedResponseError(response.status, response.getheaders(), body)
+
 
     def _scrape_sig(self, path='/alerts'):
         """
@@ -306,16 +336,12 @@ class GAlertsManager(object):
         prevent xss attacks, so we need to scrape this out and submit it along
         with any forms we POST.
         """
-        headers = {'Cookie': self.cookie}
-        conn = HTTPConnection('www.google.com')
-        conn.request('GET', path, None, headers)
-        response = conn.getresponse()
-        body = response.read()
-        try:
-            if response.status != 200:
-                raise UnexpectedResponseError(response.status, response.getheaders(), body)
-        finally:
-            conn.close()
+        sig_page_url = 'http://www.google.com%s?hl=en&gl=us' % path 
+        sig_response = self.opener.open(sig_page_url)
+
+        body = sig_response.read()
+        if sig_response.code != 200:
+            raise UnexpectedResponseError(sig_response.code, sig_response.headers, body)
         soup = BeautifulSoup(body)
         sig = soup.findChild('input', attrs={'name': 'sig'})['value']
         return str(sig)
@@ -326,16 +352,14 @@ class GAlertsManager(object):
         and "hps" which must be scraped and passed along when modifying it
         along with the "sig" hidden input value to prevent xss attacks.
         """
-        headers = {'Cookie': self.cookie}
-        conn = HTTPConnection('www.google.com')
-        conn.request('GET', '/alerts/edit?hl=en&gl=us&s=%s' % alert._s, None, headers)
-        response = conn.getresponse()
-        body = response.read()
-        try:
-            if response.status != 200:
-                raise UnexpectedResponseError(response.status, response.getheaders(), body)
-        finally:
-            conn.close()
+        es_hps_page_url = 'http://www.google.com/alerts/edit?hl=en&gl=us&s=%s' % alert._s 
+        es_hps_response = self.opener.open(es_hps_page_url)
+
+        body = es_hps_response.read()
+
+        if es_hps_response.code != 200:
+            raise UnexpectedResponseError(es_hps_response.code, es_hps_response.headers, body)
+        
         soup = BeautifulSoup(body)
         sig = soup.findChild('input', attrs={'name': 'sig'})['value']
         sig = str(sig)
@@ -352,36 +376,43 @@ class GAlertsManager(object):
         account, wraps them in :class:`Alert` objects, and returns a generator
         you can use to iterate over them.
         """
-        headers = {'Cookie': self.cookie}
-        conn = HTTPConnection('www.google.com')
-        conn.request('GET', '/alerts/manage?hl=en&gl=us', None, headers)
-        response = conn.getresponse()
-        body = response.read()
-        try:
-            if response.status != 200:
-                raise UnexpectedResponseError(response.status, response.getheaders(), body)
-        finally:
-            conn.close()
+        # Load sign in page
+        print "GAlertsManager.alerts()"
+        alerts_page_url = 'http://www.google.com/alerts/manage?hl=en&gl=us'
+        alerts_page_response = self.opener.open(alerts_page_url)
+
+        body = alerts_page_response.read()
+
+        if alerts_page_response.code != 200:
+            raise UnexpectedResponseError(alerts_page_response.code, alerts_page_response.headers, body)
+
         soup = BeautifulSoup(body, convertEntities=BeautifulSoup.HTML_ENTITIES)
         trs = soup.findAll('tr', attrs={'class': 'data_row'})
         for tr in trs:
             tds = tr.findAll('td')
             # annoyingly, if you have no alerts, Google tells you this in
             # a <tr> with class "data_row" in a single <td>
-            if len(tds) < 6:
+            if len(tds) < 5:
                 # we continue rather than break because there could be
                 # subsequent iterations for other email addresses associated
                 # with this account which do have alerts
                 continue
             tdcheckbox = tds[0]
+#            print "item 0: %s" % tdcheckbox
             tdquery = tds[1]
+#            print "item 1: %s" % tdquery
             tdtype = tds[2]
+#            print "item 2: %s" % tdtype
             tdfreq = tds[3]
-            # XXX tdnresults = tds[4]
-            tddeliver = tds[5]
+#            print "item 3: %s" % tdfreq
+            tddeliver = tds[4]
+#            print "item 4: %s" % tddeliver
+            tdfeed = tds[5]
+#            print "item 5: %s" % tdfeed
             s = tdcheckbox.findChild('input')['value']
             s = str(s)
             query = tdquery.findChild('a').next
+            
             query = unicode(query)
             type = tdtype.findChild('font').next
             type = str(type)
@@ -389,14 +420,19 @@ class GAlertsManager(object):
             freq = tdfreq.findChild('font').next
             freq = str(freq)
             deliver = tddeliver.findChild('font').next
+#            print "deliver: %s" % deliver
+            feed = tdfeed.findChild('font').next
+#            print "feed: %s" % feed
             if deliver == DELIVER_EMAIL:
                 feedurl = None
                 deliver = DELIVER_EMAIL # normalize
             else: # deliver is an anchor tag
-                feedurl = deliver['href']
+                feedurl = feed['href']
                 feedurl = str(feedurl)
+#                print feedurl
                 deliver = DELIVER_FEED
             email = self.email # scrape out of html if and when we support accounts with multiple addresses
+            print " Alert.alerts(): type=%s query=%s" % (str(type), query) 
             yield Alert(email, s, query, type, freq, deliver, feedurl=feedurl)
     
     def create(self, query, type, feed=True,
@@ -412,30 +448,29 @@ class GAlertsManager(object):
             should be delivered; used only for email alerts (feed alerts are
             updated in real time)
         """
-        headers = {'Cookie': self.cookie,
-                   'Content-type': 'application/x-www-form-urlencoded; charset=utf-8'}
+        print "GAlertsManager.create() query=%s" % query
+        feedparam = self.email
+        freqparam = freq
+        if feed:
+            feedparam = DELIVER_FEED
+            freqparam = ALERT_FREQS[FREQ_AS_IT_HAPPENS]
         params = safe_urlencode({
             'q': query,
-            'e': DELIVER_FEED if feed else self.email,
-            'f': ALERT_FREQS[FREQ_AS_IT_HAPPENS] if feed else freq,
+            'e': feedparam,
+            'f': freqparam,
             't': ALERT_TYPES[type],
             'sig': self._scrape_sig(),
             })
-        conn = HTTPConnection('www.google.com')
-        conn.request('POST', '/alerts/create?hl=en&gl=us', params, headers)
-        response = conn.getresponse()
-        try:
-            if response.status != 302:
-                raise UnexpectedResponseError(response.status, response.getheaders(), response.read())
-        finally:
-            conn.close()
+        create_page_url = 'http://www.google.com/alerts/create?hl=en&gl=us'
+        create_response = self.opener.open(create_page_url, params)
+        if create_response.code != 200:
+            raise UnexpectedResponseError(create_response.code, create_response.headers, create_response.read())
 
     def update(self, alert):
         """
         Updates an existing alert which has been modified.
         """
-        headers = {'Cookie': self.cookie,
-                   'Content-type': 'application/x-www-form-urlencoded; charset=utf-8'}
+        print "GAlertsManager.update()"
         sig, es, hps = self._scrape_sig_es_hps(alert)
         params = {
             'd': DELIVER_TYPES.get(alert.deliver, DELIVER_DEFAULT_VAL),
@@ -450,35 +485,32 @@ class GAlertsManager(object):
         if alert.deliver == DELIVER_EMAIL:
             params['f'] = ALERT_FREQS[alert.freq]
         params = safe_urlencode(params)
-        conn = HTTPConnection('www.google.com')
-        conn.request('POST', '/alerts/save?hl=en&gl=us', params, headers)
-        response = conn.getresponse()
-        try:
-            if response.status != 302:
-                raise UnexpectedResponseError(response.status, response.getheaders(), response.read())
-        finally:
-            conn.close()
+        
+        update_page_url = 'http://www.google.com/alerts/save?hl=en&gl=us'
+        update_response = self.opener.open(update_page_url, params)
+        if update_response.code != 200:
+            raise UnexpectedResponseError(update_response.code, update_response.headers, update_response.read())
 
     def delete(self, alert):
         """
         Deletes an existing alert.
         """
-        headers = {'Cookie': self.cookie,
-                   'Content-type': 'application/x-www-form-urlencoded'}
+        #headers = {'Cookie': self.cookie,
+        #           'Content-type': 'application/x-www-form-urlencoded'}
+        print "about to delete alert %s" % alert.query
         params = urlencode({
             'da': 'Delete',
             'e': self.email,
             's': alert._s,
             'sig': self._scrape_sig(path='/alerts/manage?hl=en&gl=us'),
             })
-        conn = HTTPConnection('www.google.com')
-        conn.request('POST', '/alerts/save?hl=en&gl=us', params, headers)
-        response = conn.getresponse()
-        try:
-            if response.status != 302:
-                raise UnexpectedResponseError(response.status, response.getheaders(), response.read())
-        finally:
-            conn.close()
+        delete_page_url = 'http://www.google.com/alerts/save?hl=en&gl=us'
+        delete_response = self.opener.open(delete_page_url, params)
+
+        if delete_response.code != 200:
+            print "delete_response.code:"
+            print delete_response.code
+            raise UnexpectedResponseError(delete_response.code, delete_response.headers, delete_response.read())
 
 
 def main():
@@ -618,7 +650,10 @@ def main():
                 query = prompt_query()
                 type = prompt_type()
                 feed = prompt_deliver() == DELIVER_FEED
-                freq = ALERT_FREQS[FREQ_AS_IT_HAPPENS] if feed else prompt_freq()
+                if feed:
+                    freq = ALERT_FREQS[FREQ_AS_IT_HAPPENS] 
+                else:
+                    freq = prompt_freq()
                 try:
                     gam.create(query, type, feed=feed, freq=freq)
                     print '\nAlert created.'
@@ -632,8 +667,11 @@ def main():
                 alert.query = prompt_query(default=alert.query)
                 alert.type = prompt_type(default=alert.type)
                 alert.deliver = prompt_deliver(current=alert.deliver)
-                alert.freq = FREQ_AS_IT_HAPPENS if alert.deliver != DELIVER_EMAIL \
-                    else prompt_freq(default=alert.freq)
+                 
+                if alert.deliver != DELIVER_EMAIL:
+                    alert.freq = FREQ_AS_IT_HAPPENS
+                else: 
+                    alert.freq = prompt_freq(default=alert.freq)
                 try:
                     gam.update(alert)
                     print '\nAlert modified.'
